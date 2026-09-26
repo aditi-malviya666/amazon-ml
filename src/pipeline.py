@@ -1,4 +1,3 @@
-import os
 from typing import Dict, List, Set, Tuple
 import lightgbm as lgb
 import numpy as np
@@ -23,7 +22,7 @@ class HighRankEntityResolutionPipeline:
             colsample_bytree=0.85,
             class_weight="balanced",
             random_state=42,
-            n_jobs=-1,
+            n_jobs=-1,          # Uses ALL CPU cores on Colab
         )
 
     def train_and_calibrate(
@@ -33,7 +32,16 @@ class HighRankEntityResolutionPipeline:
         ground_truth: Dict[str, Set[str]],
         val_split: float = 0.2,
     ):
-        """Executes entity-level stratified training and margin threshold calibration."""
+        """
+        Full training pipeline:
+        1. Splits S1 into train/val stratified by entity
+        2. Pre-fits TF-IDF ONCE on full candidate pool
+        3. Runs blocking for train and val using cached TF-IDF (no rebuild!)
+        4. Extracts 19-feature RapidFuzz vectors per candidate pair
+        5. Trains LightGBM classifier with early stopping
+        6. Calibrates precision threshold via 100-combo grid sweep
+        """
+        # Entity-level train/val split (never split mid-entity)
         s1_entities = df_s1["entity_id"].unique()
         np.random.seed(42)
         np.random.shuffle(s1_entities)
@@ -46,35 +54,48 @@ class HighRankEntityResolutionPipeline:
         df_val_s1 = df_s1[df_s1["entity_id"].isin(val_ids)].reset_index(drop=True)
         val_gt = {k: v for k, v in ground_truth.items() if k in val_ids}
 
-        print("\n" + "="*50)
-        print("[STEP 3/5] Sparse Blocking (TF-IDF & Math)")
-        print("="*50)
-        print(f"Generating candidates for {len(df_train_s1)} training S1 entities...")
-        train_candidates = self.blocker.retrieve_candidates(df_train_s1, df_cand)
+        # ── STEP 3: Blocking ──────────────────────────────────────────────────
+        print("\n" + "=" * 55)
+        print("[STEP 3/5]  Sparse Blocking (TF-IDF)")
+        print("=" * 55)
 
-        print("\n" + "="*50)
-        print("[STEP 4/5] Fuzzy Feature Engineering (RapidFuzz)")
-        print("="*50)
+        # SPEED OPTIMIZATION: fit TF-IDF ONCE on full candidate pool,
+        # then reuse for both train and val transforms (no rebuild!).
+        print(f"  Fitting TF-IDF on {len(df_cand):,} candidates (done once, reused for train+val)...")
+        self.blocker.fit_candidates(df_cand)
+
+        print(f"  Retrieving candidates for {len(df_train_s1):,} train S1 entities...")
+        train_candidates = self.blocker.retrieve_candidates(df_train_s1)
+
+        print(f"  Retrieving candidates for {len(df_val_s1):,} val S1 entities...")
+        val_candidates = self.blocker.retrieve_candidates(df_val_s1)
+
+        # ── STEP 4: Feature Engineering ───────────────────────────────────────
+        print("\n" + "=" * 55)
+        print("[STEP 4/5]  Fuzzy Feature Engineering (RapidFuzz)")
+        print("=" * 55)
+
+        # Pre-convert DataFrames to dicts ONCE and pass to both calls
+        # (avoids rebuilding the dict inside build_feature_matrix twice)
+        print("  Converting DataFrames to hash maps (done once for train+val)...")
+        s1_dict = df_s1.set_index("entity_id").to_dict(orient="index")
+        cand_dict = df_cand.set_index("entity_id").to_dict(orient="index")
+
         X_train, y_train, _ = build_feature_matrix(
-            train_candidates, df_train_s1, df_cand, ground_truth
+            train_candidates, s1_dict, cand_dict, ground_truth
         )
-
-        # IMPORTANT: Validation blocking uses the FULL candidate pool (df_cand)
-        # to avoid data leakage from the training split
-        print(f"Generating candidates for {len(df_val_s1)} validation S1 entities...")
-        val_candidates = self.blocker.retrieve_candidates(df_val_s1, df_cand)
         X_val, y_val, val_pairs = build_feature_matrix(
-            val_candidates, df_val_s1, df_cand, ground_truth
+            val_candidates, s1_dict, cand_dict, ground_truth
         )
 
-        print("\n" + "="*50)
-        print("[STEP 5/5] LightGBM Training & Threshold Tuning")
-        print("="*50)
-        print(f"Training on {len(X_train)} pairs | Validating on {len(X_val)} pairs")
+        # ── STEP 5: LightGBM ──────────────────────────────────────────────────
+        print("\n" + "=" * 55)
+        print("[STEP 5/5]  LightGBM Training & Threshold Tuning")
+        print("=" * 55)
+        print(f"  Training on {len(X_train):,} pairs | Validating on {len(X_val):,} pairs")
 
-        # SAFETY: If training data has no positive labels, skip (shouldn't happen on real data)
-        if y_train.sum() == 0:
-            print("WARNING: No positive labels found in training data. Skipping model fit.")
+        if len(y_train) == 0 or y_train.sum() == 0:
+            print("  WARNING: No positive labels in training data. Check data quality.")
             return
 
         self.classifier.fit(
@@ -93,19 +114,34 @@ class HighRankEntityResolutionPipeline:
     def generate_test_submission(
         self, df_test_s1: pd.DataFrame, df_test_cand: pd.DataFrame
     ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
-        """Runs blocking, feature compilation, and matching inference on test set."""
-        print("\nExecuting blocking on test partition...")
-        test_candidate_pool = self.blocker.retrieve_candidates(df_test_s1, df_test_cand)
+        """
+        Runs inference on test data.
+        Fits a fresh TF-IDF on test candidate pool (different from train pool),
+        then runs blocking and feature extraction.
+        """
+        print("\n" + "=" * 55)
+        print("[TEST]  Generating Submission")
+        print("=" * 55)
 
-        # Build candidate_pairs map — must contain ALL test S1 IDs (even singletons with [])
+        # Fit new TF-IDF on test candidate pool (different data than training)
+        print(f"  Fitting TF-IDF on {len(df_test_cand):,} test candidates...")
+        self.blocker.fit_candidates(df_test_cand)
+
+        print(f"  Blocking {len(df_test_s1):,} test S1 entities...")
+        test_candidate_pool = self.blocker.retrieve_candidates(df_test_s1)
+
+        # Build candidate_pairs map — ALL test S1 IDs must appear (including singletons)
         all_test_s1 = df_test_s1["entity_id"].tolist()
         candidate_pairs_map: Dict[str, List[str]] = {s1_id: [] for s1_id in all_test_s1}
         for s1_id, items in test_candidate_pool.items():
             candidate_pairs_map[s1_id] = [cid for cid, _, _ in items]
 
-        print("Building feature matrix for test candidate pairs...")
+        print("  Building feature matrix for test candidate pairs...")
+        test_cand_dict = df_test_cand.set_index("entity_id").to_dict(orient="index")
+        test_s1_dict = df_test_s1.set_index("entity_id").to_dict(orient="index")
+
         X_test, _, test_pairs = build_feature_matrix(
-            test_candidate_pool, df_test_s1, df_test_cand
+            test_candidate_pool, test_s1_dict, test_cand_dict
         )
 
         if len(X_test) > 0:
@@ -115,16 +151,14 @@ class HighRankEntityResolutionPipeline:
 
         matching_map = self.optimizer.filter_candidates(test_pairs, test_probs, all_test_s1)
 
-        # CONSTRAINT CHECK: Verify every match also exists in candidate_pairs_map
-        orphan_count = 0
-        for s1_id, matches in matching_map.items():
-            candidates = set(candidate_pairs_map.get(s1_id, []))
-            for m in matches:
-                if m not in candidates:
-                    orphan_count += 1
+        # CONSTRAINT CHECK: every matched ID must exist in its candidate set
+        orphan_count = sum(
+            1 for s1_id, matches in matching_map.items()
+            for m in matches if m not in set(candidate_pairs_map.get(s1_id, []))
+        )
         if orphan_count > 0:
-            print(f"WARNING: {orphan_count} matched IDs not in candidate_pairs! Check pipeline.")
+            print(f"  ⚠ WARNING: {orphan_count} matched IDs missing from candidate_pairs!")
         else:
-            print("Constraint check PASSED: All matched IDs are subsets of their candidates.")
+            print("  ✅ Constraint check PASSED: all matches are subsets of candidates.")
 
         return candidate_pairs_map, matching_map

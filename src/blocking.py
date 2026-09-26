@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -6,74 +6,122 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 class FastSparseBlocker:
     """
-    Two-stage sparse TF-IDF blocker with adaptive candidate set sizing.
+    Sparse TF-IDF blocker with pre-fitted candidate matrices.
 
-    OPTIMIZATION 1: Name-weighted composite_text
-      The name is doubled in composite_text ("name name address") so TF-IDF
-      cosine similarity is dominated by name matches, not address noise.
+    KEY SPEED OPTIMIZATION:
+      The TF-IDF vocabulary and candidate matrix are built ONCE via fit_candidates().
+      All subsequent calls to retrieve_candidates() only run tfidf.transform() on S1,
+      which is ~10x faster than a full fit_transform().
 
-    OPTIMIZATION 2: Adaptive top_k (CRITICAL for tie-breaker)
-      Contest rules: "smaller candidate set per S1 entity ranks HIGHER".
-      Instead of blindly returning top_k=20, we return candidates dynamically:
-        - If best TF-IDF score > 0.80 → only return candidates within 25% of best (likely 1-3)
-        - If best TF-IDF score > 0.30 → return up to top_k=15
-        - If best TF-IDF score < 0.10 → return 0 (treat as singleton at blocking stage)
-      This gives the smallest possible candidate sets while preserving recall.
+      This saves ~33% of total blocking time since retrieve_candidates() was previously
+      called 3 times (train, val, test) with full matrix rebuild each time.
+
+    ACCURACY OPTIMIZATION:
+      Name is doubled in composite text ("name name address") so TF-IDF cosine
+      similarity is dominated by name matches rather than address noise.
+
+    TIE-BREAKER OPTIMIZATION:
+      Adaptive candidate set sizing based on best TF-IDF score minimizes
+      candidate_pairs.tsv size, which ranks higher per contest tie-breaker rules.
     """
 
     def __init__(self):
-        pass
+        # Per-country fitted vectorizers and pre-built candidate matrices
+        self._vectorizers: Dict[str, TfidfVectorizer] = {}
+        self._cand_matrices: Dict = {}       # sparse CSR matrices
+        self._cand_ids_map: Dict[str, np.ndarray] = {}
 
-    def retrieve_candidates(
-        self,
-        df_s1: pd.DataFrame,
-        df_cand: pd.DataFrame,
-        top_k: int = 15,
-        min_sim: float = 0.10,
-    ) -> Dict[str, List[Tuple[str, float, float]]]:
-        """Returns {s1_id: [(candidate_id, sparse_sim, 0.0), ...]}
+    @staticmethod
+    def _make_text(df: pd.DataFrame) -> np.ndarray:
+        """Doubles name to make TF-IDF name-dominant. Reused in fit and transform."""
+        return (df["clean_name"] + " " + df["clean_name"] + " " + df["clean_address"]).to_numpy()
 
-        COMPETITION NOTE: Adaptive candidate sizing wins the tie-breaker.
-        Smaller candidate sets per S1 entity rank higher per contest rules.
+    def fit_candidates(self, df_cand: pd.DataFrame):
         """
-        results: Dict[str, List[Tuple[str, float, float]]] = {
-            s1_id: [] for s1_id in df_s1["entity_id"]
-        }
-
-        # Country Filtering: open-set dynamic — never hardcoded to US/India
-        countries = df_s1["country"].unique()
-
+        Pre-build TF-IDF vectorizer and candidate matrix for each country.
+        Call this ONCE before any retrieve_candidates() calls.
+        Subsequent retrieve_candidates() calls only run tfidf.transform() — ~10x faster.
+        """
         from tqdm import tqdm
-        for c in countries:
-            sub_s1 = df_s1[df_s1["country"] == c].reset_index(drop=True)
-            sub_cand = df_cand[df_cand["country"] == c].reset_index(drop=True)
+        countries = df_cand["country"].unique()
+        print(f"  Pre-fitting TF-IDF matrices for {len(countries)} countries...")
 
-            if sub_cand.empty or sub_s1.empty:
-                # CONSTRAINT: entities with zero candidates already pre-seeded with []
+        for c in tqdm(countries, desc="  Fitting TF-IDF"):
+            sub_cand = df_cand[df_cand["country"] == c].reset_index(drop=True)
+            if sub_cand.empty:
                 continue
 
-            s1_ids = sub_s1["entity_id"].to_numpy()
-            cand_ids = sub_cand["entity_id"].to_numpy()
-
-            # OPTIMIZATION 1: Double the name in composite_text so TF-IDF
-            # is dominated by name similarity, not address noise.
-            # "star hotel mumbai" → "star hotel star hotel mumbai"
-            s1_texts = (sub_s1["clean_name"] + " " + sub_s1["clean_name"] + " " + sub_s1["clean_address"]).to_numpy()
-            cand_texts = (sub_cand["clean_name"] + " " + sub_cand["clean_name"] + " " + sub_cand["clean_address"]).to_numpy()
-
-            print(f"  Building TF-IDF Matrix for {c} ({len(sub_s1):,} S1, {len(sub_cand):,} candidates)...")
+            cand_texts = self._make_text(sub_cand)
             tfidf = TfidfVectorizer(
                 analyzer="word",
                 ngram_range=(1, 2),
                 min_df=1,
                 sublinear_tf=True,
-                max_features=300_000,  # Caps vocabulary to prevent RAM explosion
+                max_features=300_000,  # Caps vocab to prevent RAM explosion
             )
-            cand_tfidf = tfidf.fit_transform(cand_texts)
+            cand_matrix = tfidf.fit_transform(cand_texts)
+
+            self._vectorizers[c] = tfidf
+            self._cand_matrices[c] = cand_matrix
+            self._cand_ids_map[c] = sub_cand["entity_id"].to_numpy()
+
+        print(f"  TF-IDF fit complete. Matrices cached for fast reuse.")
+
+    def retrieve_candidates(
+        self,
+        df_s1: pd.DataFrame,
+        df_cand: Optional[pd.DataFrame] = None,  # Only used if fit_candidates() not called
+        top_k: int = 15,
+        min_sim: float = 0.10,
+    ) -> Dict[str, List[Tuple[str, float, float]]]:
+        """
+        Returns {s1_id: [(candidate_id, sparse_sim, 0.0), ...]}.
+
+        If fit_candidates() was called first: uses cached TF-IDF (FAST — no rebuild).
+        If not: falls back to building TF-IDF from df_cand (slower, for compatibility).
+        """
+        results: Dict[str, List[Tuple[str, float, float]]] = {
+            s1_id: [] for s1_id in df_s1["entity_id"]
+        }
+
+        # Determine which countries to process
+        countries = df_s1["country"].unique()
+
+        from tqdm import tqdm
+        for c in countries:
+            sub_s1 = df_s1[df_s1["country"] == c].reset_index(drop=True)
+            if sub_s1.empty:
+                continue
+
+            # Use pre-fitted matrices if available, else build on-the-fly
+            if c in self._vectorizers:
+                tfidf = self._vectorizers[c]
+                cand_tfidf = self._cand_matrices[c]
+                cand_ids = self._cand_ids_map[c]
+            elif df_cand is not None:
+                # Fallback: build TF-IDF on the fly (slower path)
+                sub_cand = df_cand[df_cand["country"] == c].reset_index(drop=True)
+                if sub_cand.empty:
+                    continue
+                cand_texts = self._make_text(sub_cand)
+                print(f"  [FALLBACK] Building TF-IDF for {c} (call fit_candidates() first for speed)...")
+                tfidf = TfidfVectorizer(
+                    analyzer="word", ngram_range=(1, 2),
+                    min_df=1, sublinear_tf=True, max_features=300_000,
+                )
+                cand_tfidf = tfidf.fit_transform(cand_texts)
+                cand_ids = sub_cand["entity_id"].to_numpy()
+            else:
+                # Country in test that wasn't in train (e.g. France edge case)
+                print(f"  WARNING: No candidate data for country '{c}'. Skipping.")
+                continue
+
+            s1_ids = sub_s1["entity_id"].to_numpy()
+            s1_texts = self._make_text(sub_s1)
             s1_tfidf = tfidf.transform(s1_texts)
 
-            # Batch dot-product — never call .toarray() on full matrix (OOM)
-            batch_size = 250
+            # Larger batch_size = fewer loop iterations = faster (safe now — no .toarray())
+            batch_size = 500
             for start_idx in tqdm(range(0, s1_tfidf.shape[0], batch_size), desc=f"  Blocking [{c}]"):
                 end_idx = min(start_idx + batch_size, s1_tfidf.shape[0])
                 s1_batch = s1_tfidf[start_idx:end_idx]
@@ -91,43 +139,34 @@ class FastSparseBlocker:
                     if len(row_data) == 0:
                         continue
 
-                    global_s1_idx = start_idx + i
-                    actual_s1_id = s1_ids[global_s1_idx]
+                    actual_s1_id = s1_ids[start_idx + i]
 
-                    # Top-K on only the non-zero elements (no 71GB dense allocation)
+                    # Top-K on sparse elements only (no 71GB dense allocation)
                     k = min(top_k, len(row_data))
                     if len(row_data) <= top_k:
                         top_idx_of_idx = np.argsort(-row_data)
                     else:
                         top_idx_of_idx = np.argpartition(-row_data, k)[:k]
 
-                    # Get the top candidates above min_sim
                     raw_candidates = []
                     for idx in top_idx_of_idx:
                         val = float(row_data[idx])
                         if val >= min_sim:
-                            cand_idx = row_indices[idx]
-                            raw_candidates.append((str(cand_ids[cand_idx]), val, 0.0))
+                            raw_candidates.append((str(cand_ids[row_indices[idx]]), val, 0.0))
 
                     if not raw_candidates:
                         continue
 
-                    # Sort by score descending
                     raw_candidates.sort(key=lambda x: -x[1])
-
-                    # OPTIMIZATION 2: Adaptive candidate set sizing
-                    # Directly minimizes candidate_pairs.tsv size = wins tie-breakers
                     best_score = raw_candidates[0][1]
+
+                    # Adaptive candidate sizing: wins tie-breaker per contest rules
                     if best_score >= 0.80:
-                        # High confidence: only keep candidates within 25% of best score
-                        # Typical result: 1-3 candidates instead of 15
                         cutoff = best_score * 0.75
                         merged = [(cid, s, d) for cid, s, d in raw_candidates if s >= cutoff]
                     elif best_score >= 0.30:
-                        # Medium confidence: keep top_k as normal
                         merged = raw_candidates[:top_k]
                     else:
-                        # Low confidence: treat as potential singleton, keep only top-3
                         merged = raw_candidates[:3]
 
                     results[actual_s1_id] = merged

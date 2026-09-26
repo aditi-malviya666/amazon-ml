@@ -90,19 +90,29 @@ def extract_pairwise_vector(
 
 def build_feature_matrix(
     candidate_map: Dict[str, List[Tuple[str, float, float]]],
-    df_s1: pd.DataFrame,
-    df_cand: pd.DataFrame,
+    s1_source,   # accepts dict {entity_id: row_dict} OR pd.DataFrame
+    cand_source, # accepts dict {entity_id: row_dict} OR pd.DataFrame
     ground_truth: Dict[str, Set[str]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[Tuple[str, str]]]:
-    """Compiles candidate dictionary into feature matrix and binary training labels."""
-    print("Converting DataFrames to hash maps for instant access...")
-    s1_dict = df_s1.set_index("entity_id").to_dict(orient="index")
-    cand_dict = df_cand.set_index("entity_id").to_dict(orient="index")
+    """Compiles candidate dictionary into feature matrix and binary training labels.
+
+    Accepts either pre-built dicts (fast, recommended) or raw DataFrames (auto-converts).
+    Passing pre-built dicts avoids repeated set_index().to_dict() conversions.
+    """
+    # Accept either pre-built dict or DataFrame
+    if isinstance(s1_source, pd.DataFrame):
+        print("  Converting DataFrames to hash maps for instant access...")
+        s1_dict = s1_source.set_index("entity_id").to_dict(orient="index")
+        cand_dict = cand_source.set_index("entity_id").to_dict(orient="index")
+    else:
+        # Already pre-built dicts — no conversion needed (fast path)
+        s1_dict = s1_source
+        cand_dict = cand_source
 
     X_list, y_list, pair_list = [], [], []
 
     from tqdm import tqdm
-    for s1_id, candidates in tqdm(candidate_map.items(), desc="Extracting Features"):
+    for s1_id, candidates in tqdm(candidate_map.items(), desc="  Extracting Features"):
         if s1_id not in s1_dict:
             continue
         s1_row = s1_dict[s1_id]
